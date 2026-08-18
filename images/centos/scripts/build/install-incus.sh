@@ -1,0 +1,215 @@
+#!/bin/bash
+set -euo pipefail
+################################################################################
+##  File:  install-incus.sh
+##  Desc:  Install Incus from source for CentOS/AlmaLinux (orchestrator)
+##  Note:  Sources per-step scripts for each installation phase.
+##         Supports: ppc64le, s390x, x86_64
+################################################################################
+
+exec > >(tee -i /tmp/install-incus.log)
+exec 2>&1
+
+# --------------------------------------------------
+# Environment Setup
+# --------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+SCRIPT_HELPER_SCRIPTS="${SCRIPT_DIR}/../helpers"
+
+# shellcheck disable=SC1091
+source "$SCRIPT_HELPER_SCRIPTS"/install.sh
+
+ARCH="${ARCH:-$(uname -m)}"
+CONFIG_FILE="${REPO_ROOT}/scripts/assets/incus_init_host_${ARCH}.yml"
+
+# Version configuration (can be overridden via environment variables)
+RAFT_VERSION="${RAFT_VERSION:-v0.22.1}"
+INCUS_VERSION="${INCUS_VERSION:-v7.0.1}"
+
+# LVM configuration (can be overridden via environment variables)
+USE_LVM="${USE_LVM:-true}"
+LVM_LOOP_SIZE="${LVM_LOOP_SIZE:-200G}"
+LVM_VG_NAME="${LVM_VG_NAME:-vg_incus}"
+LVM_LOOP_FILE="/var/lib/incus/disks/incus-lvm.img"
+
+# Export so sourced step scripts can access them
+export ARCH RAFT_VERSION INCUS_VERSION USE_LVM LVM_LOOP_SIZE LVM_VG_NAME LVM_LOOP_FILE CONFIG_FILE
+
+# --------------------------------------------------
+# Skip build/install if Incus is already installed and daemon is healthy
+# --------------------------------------------------
+SKIP_INCUS_BUILD=false
+INCUS_BIN=$(command -v incus 2>/dev/null || echo "")
+if [ -n "$INCUS_BIN" ] && \
+   "$INCUS_BIN" admin waitready --timeout=30 >/dev/null 2>&1 && \
+   ip link show incusbr0 >/dev/null 2>&1; then
+    INSTALLED_VERSION=$("$INCUS_BIN" --version 2>/dev/null | head -n1 || echo "unknown")
+    echo "[INFO] Incus already installed (version: ${INSTALLED_VERSION}), daemon healthy, bridge up — skipping build."
+    SKIP_INCUS_BUILD=true
+fi
+
+if [ "$SKIP_INCUS_BUILD" = "false" ]; then
+
+echo "=================================================="
+echo " Installing Incus Environment"
+echo " Architecture : ${ARCH}"
+echo " Storage      : $([ "$USE_LVM" = "true" ] && echo "LVM ($LVM_VG_NAME)" || echo "DIR")"
+echo " Config File  : ${CONFIG_FILE}"
+echo "=================================================="
+
+# --------------------------------------------------
+# Install Dependencies
+# --------------------------------------------------
+
+echo "[INFO] Installing dependencies..."
+install_dnfpkgs \
+    git \
+    gcc \
+    gcc-c++ \
+    make \
+    golang \
+    wget \
+    curl \
+    tar \
+    lvm2 \
+    device-mapper-persistent-data \
+    xz \
+    rsync \
+    sqlite-devel \
+    libuuid-devel \
+    lxc \
+    lxc-devel \
+    dnsmasq \
+    firewalld \
+    shadow-utils \
+    podman \
+    buildah \
+    fuse-overlayfs \
+    slirp4netns \
+    squashfs-tools \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    acl \
+    libacl-devel \
+    attr \
+    libattr-devel \
+    libcap-devel \
+    lz4-devel \
+    libuv-devel \
+    gettext \
+    systemd-devel
+
+# --------------------------------------------------
+# Step 1: Build and install raft
+# --------------------------------------------------
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/install-raft.sh"
+
+# --------------------------------------------------
+# Step 2: Build and install cowsql
+# --------------------------------------------------
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/install-cowsql.sh"
+
+# --------------------------------------------------
+# Step 3: Build and install Incus binary
+# --------------------------------------------------
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/install-incus-bin.sh"
+
+# --------------------------------------------------
+# Step 4: Setup LVM storage
+# --------------------------------------------------
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup-lvm.sh"
+
+# --------------------------------------------------
+# Step 5: Start Incus daemon
+# --------------------------------------------------
+
+# If incusd is already running and responding, skip the restart entirely.
+if /usr/local/bin/incus admin waitready --timeout=5 >/dev/null 2>&1; then
+    echo "[INFO] incusd is already running and healthy — skipping restart."
+else
+    echo "[INFO] Starting incusd..."
+
+    if pgrep -x incusd >/dev/null 2>&1; then
+        echo "[INFO] Stopping unresponsive incusd..."
+        pkill -9 incusd 2>/dev/null || true
+        sleep 1
+    fi
+    rm -f /run/incus/unix.socket
+    rm -f /var/run/incus/unix.socket
+    rm -f /var/lib/incus/unix.socket
+
+    INCUSD_LOG=$(mktemp /tmp/incusd.XXXX.log)
+    export INCUSD_LOG
+    echo "[INFO] incusd log: $INCUSD_LOG"
+
+    nohup /usr/local/bin/incusd --group incus-admin >"$INCUSD_LOG" 2>&1 &
+
+    echo "[INFO] Waiting for incusd to become ready..."
+    for _ in {1..30}; do
+        if /usr/local/bin/incus admin waitready --timeout=1 >/dev/null 2>&1; then
+            break
+        fi
+        if ! pgrep -x incusd >/dev/null 2>&1; then
+            echo "[ERROR] incusd exited unexpectedly"
+            cat "$INCUSD_LOG"
+            exit 1
+        fi
+        sleep 1
+    done
+
+    echo "[INFO] Verifying daemon..."
+    if ! /usr/local/bin/incus admin waitready --timeout=5 >/dev/null 2>&1; then
+        echo "[ERROR] incusd is not responding"
+        cat "$INCUSD_LOG"
+        exit 1
+    fi
+fi
+
+fi # end SKIP_INCUS_BUILD
+
+# --------------------------------------------------
+# Step 6: Initialize network, storage, and profile
+# --------------------------------------------------
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup-incus-network.sh"
+
+# --------------------------------------------------
+# Configure Firewalld (CentOS-specific)
+# --------------------------------------------------
+
+echo "[INFO] Configuring firewall..."
+if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd \
+        --zone=trusted \
+        --add-interface=incusbr0 \
+        --permanent || true
+
+    firewall-cmd --reload || true
+fi
+
+# --------------------------------------------------
+# Validation
+# --------------------------------------------------
+
+echo "[INFO] Running validation..."
+/usr/local/bin/incus version
+/usr/local/bin/incus network list
+/usr/local/bin/incus storage list
+/usr/local/bin/incus profile show default
+
+echo "=================================================="
+echo " Incus installation completed successfully"
+echo "=================================================="
+
+echo ""
+echo "[INFO] Incus installation and configuration completed"
+echo "[INFO] Base image import will be handled by the calling script"
+echo ""
